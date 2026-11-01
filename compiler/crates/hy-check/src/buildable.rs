@@ -498,6 +498,10 @@ struct Collector<'a> {
     /// `kind_scopes`. `set[T]` has no OpKind (it lowers to a prelude
     /// struct), so without this its element type was never checked (#2474).
     set_elem_scopes: Vec<HashMap<String, Option<String>>>,
+    /// #2921: bindings whose type is a container of sets (`[]set[T]`,
+    /// `[N]set[T]`, `map[K]set[T]`) -> the inner set's element type text and
+    /// whether the container is a map (map elements are not addressable).
+    set_container_scopes: Vec<HashMap<String, (Option<String>, bool)>>,
     /// One layer per open scope, tracking `for ... in` element bindings
     /// whose kind is copy-semantics storage (`struct`/`array`). The emitter
     /// lowers them to Go's `for _, x := range xs`, so writes through the
@@ -565,6 +569,7 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
             kind_scopes: Vec::new(),
             type_name_scopes: Vec::new(),
             set_elem_scopes: Vec::new(),
+            set_container_scopes: Vec::new(),
             copy_var_scopes: Vec::new(),
             file_consts: HashMap::new(),
             file_untyped_consts: HashSet::new(),
@@ -634,6 +639,7 @@ impl<'a> Collector<'a> {
         self.type_name_scopes.push(HashMap::new());
         self.scalar_scopes.push(HashMap::new());
         self.set_elem_scopes.push(HashMap::new());
+        self.set_container_scopes.push(HashMap::new());
         self.copy_var_scopes.push(HashSet::new());
     }
 
@@ -643,6 +649,7 @@ impl<'a> Collector<'a> {
         self.type_name_scopes.pop();
         self.scalar_scopes.pop();
         self.set_elem_scopes.pop();
+        self.set_container_scopes.pop();
         self.copy_var_scopes.pop();
     }
 
@@ -714,6 +721,58 @@ impl<'a> Collector<'a> {
             if let Some(top) = self.set_elem_scopes.last_mut() {
                 top.insert(name.to_string(), None);
             }
+            if let Some(top) = self.set_container_scopes.last_mut() {
+                top.insert(name.to_string(), (None, false));
+            }
+        }
+    }
+
+    /// #2921: record a container-of-set binding (see `set_container_scopes`).
+    fn bind_set_container(&mut self, name: &str, elem: Option<(String, bool)>) {
+        if name != "_" {
+            if let Some((e, is_map)) = elem {
+                if let Some(top) = self.set_container_scopes.last_mut() {
+                    top.insert(name.to_string(), (Some(e), is_map));
+                }
+            }
+        }
+    }
+
+    /// #2921: `[]set[int]` / `[3]set[int]` -> `("int", false)`,
+    /// `map[string]set[int]` -> `("int", true)`.
+    fn container_set_elem_of_ty(ty: &TypeExpr) -> Option<(String, bool)> {
+        match ty {
+            TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } => {
+                Self::set_elem_of_ty(elem).map(|e| (e, false))
+            }
+            TypeExpr::Map { value, .. } => Self::set_elem_of_ty(value).map(|e| (e, true)),
+            _ => None,
+        }
+    }
+
+    /// #2921: the inner set element type of a container-of-set expression.
+    fn container_set_elem_of_expr(&self, e: &Expr) -> Option<(String, bool)> {
+        match unwrap_parens(e) {
+            Expr::Ident { name, .. } => {
+                for layer in self.set_container_scopes.iter().rev() {
+                    if let Some((v, is_map)) = layer.get(name) {
+                        return v.clone().map(|v| (v, *is_map));
+                    }
+                }
+                None
+            }
+            Expr::SliceLit { elem: Some(t), .. } => Self::set_elem_of_ty(t).map(|e| (e, false)),
+            Expr::MapLit { value, .. } => Self::set_elem_of_ty(value).map(|e| (e, true)),
+            Expr::Call { callee, .. } => match unwrap_parens(callee) {
+                Expr::Ident { name, .. } if self.lookup_kind(name).is_none() => self
+                    .ck
+                    .fns
+                    .get(name.as_str())
+                    .filter(|f| f.results.len() == 1)
+                    .and_then(|f| Self::container_set_elem_of_ty(&f.results[0].ty)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -758,6 +817,8 @@ impl<'a> Collector<'a> {
                     .and_then(|f| Self::set_elem_of_ty(&f.results[0].ty)),
                 _ => None,
             },
+            // #2921: `ss[0]` / `m[k]` on a container of sets.
+            Expr::Index { base, .. } => self.container_set_elem_of_expr(base).map(|(e, _)| e),
             _ => None,
         }
     }
@@ -775,6 +836,29 @@ impl<'a> Collector<'a> {
         let Some(elem) = self.set_elem_of_expr(base) else {
             return;
         };
+        // #2921: the prelude's set methods have pointer receivers, so the
+        // receiver must be addressable. A map element (`m[k].contains(v)`)
+        // or a call result (`mk().insert(v)`) is not; Go rejects the
+        // emitted call with "cannot call pointer method".
+        let unaddressable = match unwrap_parens(base) {
+            Expr::Index { base: inner, .. } => {
+                matches!(self.container_set_elem_of_expr(inner), Some((_, true)))
+            }
+            Expr::Call { .. } => true,
+            _ => false,
+        };
+        if unaddressable {
+            self.emit_e1002(
+                base.span(),
+                format!(
+                    "cannot call `{}` on `{}`: a map element or call result is not addressable, and set methods take a pointer receiver (HYB-E1002)",
+                    name,
+                    base.render()
+                ),
+                "copy the set into a local first (`s := m[k]`), call the method on it, and store it back if it changed",
+            );
+            return;
+        }
         let want = self.kind_of_named(&elem, 0);
         let got = self.kind_of_expr(&args[0].value);
         let int_to_float_conflict = want == OpKind::Float
@@ -1296,6 +1380,7 @@ impl<'a> Collector<'a> {
             let ps = self.scalar_of_ty(&p.ty);
             self.set_scalar(&p.name, ps);
             self.bind_set_elem(&p.name, Self::set_elem_of_ty(&p.ty));
+            self.bind_set_container(&p.name, Self::container_set_elem_of_ty(&p.ty));
             self.bind_type_name(&p.name, p.ty.render());
         }
         for r in &f.results {
@@ -1491,6 +1576,13 @@ impl<'a> Collector<'a> {
         // `kind_of_expr` resolves binding-shaped operands (issue #425).
         let kinds = self.infer_local_kinds(l);
         let scalars = self.infer_local_scalars(l);
+        let set_containers: Vec<Option<(String, bool)>> = (0..l.names.len())
+            .map(|i| match (&l.ty, l.values.len() == l.names.len()) {
+                (Some(t), _) => Self::container_set_elem_of_ty(t),
+                (None, true) => self.container_set_elem_of_expr(&l.values[i]),
+                _ => None,
+            })
+            .collect();
         let set_elems: Vec<Option<String>> = (0..l.names.len())
             .map(|i| match (&l.ty, l.values.len() == l.names.len()) {
                 (Some(t), _) => Self::set_elem_of_ty(t),
@@ -1510,8 +1602,13 @@ impl<'a> Collector<'a> {
                 }
             }
         }
-        for (((name, kind), scalar), set_elem) in
-            l.names.iter().zip(kinds).zip(scalars).zip(set_elems)
+        for ((((name, kind), scalar), set_elem), set_container) in l
+            .names
+            .iter()
+            .zip(kinds)
+            .zip(scalars)
+            .zip(set_elems)
+            .zip(set_containers)
         {
             // #1031: a same-scope `:=` re-define keeps the EXISTING variable
             // (and its type) in Go, so only a fresh binding takes the
@@ -1525,6 +1622,7 @@ impl<'a> Collector<'a> {
                 self.set_scalar(name, scalar);
             }
             self.bind_set_elem(name, set_elem);
+            self.bind_set_container(name, set_container);
             if !track_read {
                 self.exempt(name);
                 continue;
@@ -1878,6 +1976,12 @@ impl<'a> Collector<'a> {
     }
 
     fn iterate_var_kinds(&self, expr: &Expr, n_vars: usize) -> Vec<OpKind> {
+        // #2921: `for v in s` over a `set[T]` binds `v` as `T`.
+        if n_vars == 1 {
+            if let Some(elem) = self.set_elem_of_expr(expr) {
+                return vec![self.kind_of_named(&elem, 0)];
+            }
+        }
         match self.kind_of_expr(expr) {
             OpKind::Slice(e) | OpKind::Array(e) | OpKind::Chan(e) => {
                 if n_vars >= 2 {
@@ -2260,6 +2364,7 @@ impl<'a> Collector<'a> {
                     let ps = self.scalar_of_ty(&p.ty);
                     self.set_scalar(&p.name, ps);
                     self.bind_set_elem(&p.name, Self::set_elem_of_ty(&p.ty));
+                    self.bind_set_container(&p.name, Self::container_set_elem_of_ty(&p.ty));
                     self.bind_type_name(&p.name, p.ty.render());
                 }
                 for r in results {
@@ -3095,6 +3200,18 @@ impl<'a> Collector<'a> {
                         "is_some" | "is_none" if args.is_empty() => {
                             return Some(vec![OpKind::Bool])
                         }
+                        _ => {}
+                    }
+                }
+                // #2921: the set prelude's `insert` / `contains` return
+                // `bool`, `remove` returns nothing, `len()` returns `int`.
+                if self.set_elem_of_expr(base).is_some() {
+                    match name.as_str() {
+                        "insert" | "contains" if args.len() == 1 => {
+                            return Some(vec![OpKind::Bool])
+                        }
+                        "remove" if args.len() == 1 => return Some(Vec::new()),
+                        "len" if args.is_empty() => return Some(vec![OpKind::Int]),
                         _ => {}
                     }
                 }
