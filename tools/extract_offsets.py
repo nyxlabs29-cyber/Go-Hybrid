@@ -18,9 +18,33 @@ import subprocess
 import sys
 
 
+_UINT = r"(?:0[xX][0-9a-fA-F]+|\d+)"
+
+
+def parse_uint(line, attr):
+    """Return (found, value) for a DW_AT_<attr> numeric attribute on `line`.
+
+    Accepts decimal (16), hexadecimal (0x10) and a single
+    `(DW_OP_plus_uconst: N)` block form, anchored to the end of the value so a
+    malformed value such as `16_corrupt` is never parsed by its leading digits.
+    A present-but-unparseable value yields (True, None) so callers fail closed.
+    """
+    m = re.search(rf"{attr}\s*:\s*(.*?)\s*$", line)
+    if m is None:
+        return False, None
+    raw = m.group(1)
+    for pat in (rf"({_UINT})", rf"(?:\d+\s+byte block:.*?)?\(DW_OP_plus_uconst:\s*({_UINT})\)"):
+        v = re.fullmatch(pat, raw)
+        if v is not None:
+            tok = v.group(1)
+            return True, int(tok, 16) if tok[:2].lower() == "0x" else int(tok)
+    return True, None
+
+
 def main(binpath):
     proc = subprocess.run(["readelf", "--debug-dump=info", binpath],
-                          capture_output=True, text=True, timeout=600)
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=600)
     if proc.returncode != 0:
         err = proc.stderr.strip()
         msg = f"readelf failed with exit code {proc.returncode}"
@@ -42,24 +66,28 @@ def main(binpath):
         if cur is None:
             continue
         nm = re.search(r"DW_AT_name\s*:\s*(.+?)\s*$", line)
-        off = re.search(r"DW_AT_data_member_location\s*:\s*(\d+)", line)
-        sz = re.search(r"DW_AT_byte_size\s*:\s*(\d+)", line)
+        off_seen, off = parse_uint(line, "DW_AT_data_member_location")
+        sz_seen, sz = parse_uint(line, "DW_AT_byte_size")
         if nm is not None:
             cur["name"] = nm.group(1)
-        if off is not None:
-            cur["off"] = int(off.group(1))
-        if sz is not None:
-            cur["size"] = int(sz.group(1))
+        if off_seen:
+            cur["off"] = off
+        if sz_seen:
+            cur["size"] = sz
+        if re.search(r"DW_AT_declaration\s*:\s*(?:1|0x1|yes)\b", line):
+            cur["declaration"] = True
 
     def members_of(struct_name):
         for i, d in enumerate(dies):
-            if d["tag"] == "DW_TAG_structure_type" and d.get("name") == struct_name:
+            if (d["tag"] == "DW_TAG_structure_type" and d.get("name") == struct_name
+                    and not d.get("declaration")):
                 base = d["depth"]
                 mem = {}
                 for e in dies[i + 1:]:
                     if e["depth"] <= base:
                         break
-                    if e["tag"] == "DW_TAG_member" and "name" in e:
+                    if (e["depth"] == base + 1 and e["tag"] == "DW_TAG_member"
+                            and "name" in e):
                         mem[e["name"]] = e.get("off")
                 return d.get("size"), mem
         return None, None
@@ -84,6 +112,11 @@ def main(binpath):
     for f in required_m:
         if m.get(f) is None:
             missing.append(f"runtime.m.{f}")
+
+    if gsize is None:
+        missing.append("runtime.g DW_AT_byte_size")
+    if msize is None:
+        missing.append("runtime.m DW_AT_byte_size")
 
     if missing:
         print(f"FAILED: missing required field(s): {', '.join(missing)}", file=sys.stderr)

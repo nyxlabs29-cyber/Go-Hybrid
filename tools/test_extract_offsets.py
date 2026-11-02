@@ -127,6 +127,63 @@ class ExtractOffsetsTests(unittest.TestCase):
         self.assertIn("m_id             = 104", output)
         self.assertIn("m locks          = 112", output)
 
+    def _run(self, text):
+        proc = subprocess.CompletedProcess(["readelf"], returncode=0, stdout=text, stderr="")
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with patch.object(extractor.subprocess, "run", return_value=proc):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    extractor.main("test_binary")
+                except SystemExit as e:
+                    code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_hex_and_plus_uconst_offsets_parse(self):
+        text = (VALID_DWARF_OUTPUT
+                .replace("DW_AT_data_member_location: 16", "DW_AT_data_member_location: 0x10")
+                .replace("DW_AT_byte_size   : 376", "DW_AT_byte_size   : 0x178")
+                .replace("DW_AT_data_member_location: 48",
+                         "DW_AT_data_member_location: 2 byte block: 23 30 \t(DW_OP_plus_uconst: 48)"))
+        code, out, _ = self._run(text)
+        self.assertEqual(code, 0)
+        self.assertIn("g_stackguard0    = 16", out)
+        self.assertIn("g_m              = 48", out)
+        self.assertIn("runtime.g size=376", out)
+
+    def test_malformed_offset_fails_closed(self):
+        text = VALID_DWARF_OUTPUT.replace("DW_AT_data_member_location: 16",
+                                          "DW_AT_data_member_location: 16_corrupt")
+        code, _, err = self._run(text)
+        self.assertNotEqual(code, 0)
+        self.assertIn("runtime.g.stackguard0", err)
+
+    def test_missing_or_invalid_byte_size_fails(self):
+        size_line = "    DW_AT_byte_size   : 376\n"
+        for repl in ("", "    DW_AT_byte_size   : bogus\n"):
+            text = VALID_DWARF_OUTPUT.replace(size_line, repl)
+            code, _, err = self._run(text)
+            self.assertNotEqual(code, 0)
+            self.assertIn("runtime.g DW_AT_byte_size", err)
+
+    def test_forward_declaration_is_skipped(self):
+        fwd = (" <1><50>: Abbrev Number: 1 (DW_TAG_structure_type)\n"
+               "    DW_AT_name        : runtime.g\n"
+               "    DW_AT_declaration : 1\n")
+        code, out, _ = self._run(fwd + VALID_DWARF_OUTPUT)
+        self.assertEqual(code, 0)
+        self.assertIn("g_stackguard0    = 16", out)
+
+    def test_nested_members_do_not_clobber_outer(self):
+        nested = (" <3><125>: Abbrev Number: 2 (DW_TAG_member)\n"
+                  "    DW_AT_name        : stackguard0\n"
+                  "    DW_AT_data_member_location: 999\n")
+        anchor = " <2><130>: Abbrev Number: 2 (DW_TAG_member)"
+        text = VALID_DWARF_OUTPUT.replace(anchor, nested + anchor, 1)
+        code, out, _ = self._run(text)
+        self.assertEqual(code, 0)
+        self.assertIn("g_stackguard0    = 16", out)
+
 
 if __name__ == "__main__":
     unittest.main()
